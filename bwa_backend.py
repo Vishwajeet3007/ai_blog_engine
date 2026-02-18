@@ -3,6 +3,7 @@ from __future__ import annotations
 import operator
 import os
 import re
+import base64
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -17,6 +18,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_community.callbacks.manager import get_openai_callback
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
@@ -284,6 +286,70 @@ def _safe_slug(title: str) -> str:
     return re.sub(r"\s+", "_", re.sub(r"[^a-z0-9 _-]+", "", title.lower())).strip("_") or "blog"
 
 
+def _extract_candidate_headings(md: str) -> List[str]:
+    headings = []
+    for line in md.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            headings.append(stripped[3:].strip())
+    return headings
+
+
+def _generate_image_specs(topic: str, md: str) -> List[ImageSpec]:
+    headings = _extract_candidate_headings(md)
+    prompts = [
+        (
+            "cover",
+            "Cover image",
+            f"Create a clean, modern editorial illustration for a technical blog about: {topic}. "
+            "No text, logos, or watermarks. High contrast, web-friendly composition."
+        )
+    ]
+
+    if headings:
+        first_heading = headings[0]
+        prompts.append(
+            (
+                _safe_slug(first_heading),
+                first_heading,
+                f"Create a technical diagram-style illustration representing this section topic: {first_heading}. "
+                "No readable text. Clear visual hierarchy and minimal style."
+            )
+        )
+
+    specs = []
+    for idx, (slug, alt, prompt) in enumerate(prompts[:2], start=1):
+        specs.append(
+            ImageSpec(
+                placeholder=f"[IMAGE_{idx}]",
+                filename=f"{idx:02d}_{slug}.png",
+                alt=alt,
+                caption=alt,
+                prompt=prompt,
+                size="1536x1024" if idx == 1 else "1024x1024",
+                quality="medium",
+            )
+        )
+
+    return specs
+
+
+def _save_generated_image(client: OpenAI, spec: ImageSpec, output_path: Path) -> bool:
+    try:
+        result = client.images.generate(
+            model="gpt-image-1",
+            prompt=spec.prompt,
+            size=spec.size,
+            quality=spec.quality,
+        )
+        b64 = result.data[0].b64_json
+        output_path.write_bytes(base64.b64decode(b64))
+        return True
+    except Exception as e:
+        print(f"[IMAGE ERROR] Failed to generate {spec.filename}: {e}")
+        return False
+
+
 def generate_and_place_images(state: State) -> dict:
     plan = state["plan"]
     md = state["merged_md"]
@@ -293,10 +359,28 @@ def generate_and_place_images(state: State) -> dict:
     images_dir = blog_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    specs = _generate_image_specs(state["topic"], md)
+    generated_paths: List[str] = []
+
+    if os.getenv("OPENAI_API_KEY"):
+        client = OpenAI()
+        for spec in specs:
+            image_path = images_dir / spec.filename
+            if _save_generated_image(client, spec, image_path):
+                generated_paths.append(image_path.as_posix())
+    else:
+        print("[IMAGE] OPENAI_API_KEY not found. Skipping image generation.")
+
+    if generated_paths:
+        image_blocks = []
+        for spec, path in zip(specs, generated_paths):
+            image_blocks.append(f"![{spec.alt}]({path})")
+        md = f"{md}\n\n## Images\n\n" + "\n\n".join(image_blocks) + "\n"
+
     blog_md_path = blog_dir / "blog.md"
     blog_md_path.write_text(md, encoding="utf-8")
 
-    return {"final": md}
+    return {"final": md, "image_specs": [s.model_dump() for s in specs]}
 
 
 # -----------------------------
