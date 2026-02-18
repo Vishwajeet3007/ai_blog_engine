@@ -284,19 +284,159 @@ def _safe_slug(title: str) -> str:
     return re.sub(r"\s+", "_", re.sub(r"[^a-z0-9 _-]+", "", title.lower())).strip("_") or "blog"
 
 
+DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
+Decide whether images are needed for THIS blog.
+
+Rules:
+- Max 3 images total.
+- Use images only when they materially improve understanding (flow/architecture/comparison).
+- Insert placeholders exactly as [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+- If no images are needed, return images=[] and md_with_placeholders identical to the input markdown.
+- Keep prompts specific for technical diagrams; avoid decorative imagery.
+Return strictly GlobalImagePlan.
+"""
+
+
+def decide_images(state: State) -> dict:
+    plan = state["plan"]
+    merged_md = state["merged_md"]
+
+    if not plan:
+        return {"md_with_placeholders": merged_md, "image_specs": []}
+
+    try:
+        planner = llm.with_structured_output(GlobalImagePlan)
+        image_plan = safe_llm_invoke(lambda: planner.invoke([
+            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            HumanMessage(content=(
+                f"Blog title: {plan.blog_title}\n"
+                f"Blog kind: {plan.blog_kind}\n"
+                f"Topic: {state['topic']}\n\n"
+                "Insert placeholders only where image helps comprehension.\n\n"
+                f"{merged_md}"
+            ))
+        ]))
+
+        return {
+            "md_with_placeholders": image_plan.md_with_placeholders,
+            "image_specs": [img.model_dump() for img in image_plan.images],
+        }
+    except Exception as e:
+        print(f"[IMAGES] decide_images failed: {e}")
+        return {"md_with_placeholders": merged_md, "image_specs": []}
+
+
+def _default_image_plan(state: State, md: str) -> dict:
+    plan = state.get("plan")
+    title = plan.blog_title if plan else state.get("topic", "Technical Blog")
+    placeholder = "[[IMAGE_1]]"
+    md_with_placeholder = md.replace(
+        f"# {title}",
+        f"# {title}\n\n{placeholder}",
+        1,
+    )
+    spec = ImageSpec(
+        placeholder=placeholder,
+        filename="overview_diagram.png",
+        alt=f"{title} architecture overview",
+        caption="High-level architecture overview",
+        prompt=(
+            f"Create a clean technical architecture diagram for: {title}. "
+            "Use labeled boxes and arrows, white background, readable text."
+        ),
+        size="1536x1024",
+        quality="medium",
+    )
+    return {
+        "md_with_placeholders": md_with_placeholder,
+        "image_specs": [spec.model_dump()],
+    }
+
+
+def _generate_image_bytes(prompt: str, size: str = "1024x1024", quality: str = "medium") -> bytes:
+    google_key = os.getenv("GOOGLE_API_KEY")
+    if not google_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set. Gemini image generation requires this key.")
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=google_key)
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=prompt,
+        config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+    )
+
+    parts = getattr(resp, "parts", None)
+    if not parts and getattr(resp, "candidates", None):
+        try:
+            parts = resp.candidates[0].content.parts
+        except Exception:
+            parts = None
+
+    for part in parts or []:
+        inline = getattr(part, "inline_data", None)
+        if inline and getattr(inline, "data", None):
+            return inline.data
+
+    raise RuntimeError("Gemini did not return image bytes.")
+
+
 def generate_and_place_images(state: State) -> dict:
     plan = state["plan"]
-    md = state["merged_md"]
+    md = state.get("md_with_placeholders") or state["merged_md"]
+    image_specs = state.get("image_specs") or []
 
+    if not plan:
+        return {"final": md}
+
+    if not image_specs:
+        fallback = _default_image_plan(state, md)
+        md = fallback["md_with_placeholders"]
+        image_specs = fallback["image_specs"]
+        print("[IMAGES] Planner returned no images. Using 1 default image spec.")
+
+    image_link_blocks = []
     blog_slug = _safe_slug(plan.blog_title)
     blog_dir = Path("blogs") / blog_slug
     images_dir = blog_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    for raw in image_specs:
+        try:
+            spec = ImageSpec(**raw)
+        except Exception:
+            continue
+
+        placeholder = spec.placeholder
+        filename = Path(spec.filename).name
+        out_path = images_dir / filename
+
+        if not out_path.exists():
+            try:
+                img_bytes = _generate_image_bytes(spec.prompt, size=spec.size, quality=spec.quality)
+                out_path.write_bytes(img_bytes)
+            except Exception as e:
+                print(f"[IMAGES] Failed generating {filename}: {e}")
+                md = md.replace(
+                    placeholder,
+                    f"*Image generation skipped: {spec.caption} ({e})*"
+                )
+                continue
+
+        img_md = f"![{spec.alt}](images/{filename})\n\n*{spec.caption}*"
+        md = md.replace(placeholder, img_md)
+        image_link_blocks.append(img_md)
+
     blog_md_path = blog_dir / "blog.md"
     blog_md_path.write_text(md, encoding="utf-8")
 
-    return {"final": md}
+    return {
+        "md_with_placeholders": md,
+        "image_specs": image_specs,
+        "final": md
+    }
 
 
 # -----------------------------
@@ -304,9 +444,11 @@ def generate_and_place_images(state: State) -> dict:
 # -----------------------------
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("decide_images", decide_images)
 reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
 reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "generate_and_place_images")
+reducer_graph.add_edge("merge_content", "decide_images")
+reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
 
