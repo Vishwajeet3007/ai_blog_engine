@@ -14,7 +14,7 @@ from langgraph.types import Send
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain.callbacks import get_openai_callback
+from langchain_community.callbacks.manager import get_openai_callback
 
 from dotenv import load_dotenv
 

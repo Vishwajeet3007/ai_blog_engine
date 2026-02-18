@@ -8,3 +8,4 @@ pydantic
 python-dotenv
 langchain_community
 google.genai
+langchain.callbacks
