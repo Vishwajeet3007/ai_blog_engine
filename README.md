@@ -2,15 +2,6 @@
 
 A LangGraph-based multi-agent application that plans, researches, writes, and packages technical blog posts with optional generated images.
 
-## Why this project is strong for a resume
-
-This project demonstrates:
-- **LLM workflow orchestration** with graph-based control flow (router → research → planning → parallel section writers → reducer).
-- **Structured outputs** via Pydantic schemas for predictable agent I/O.
-- **Production-aware reliability patterns** (fallback routing, guarded LLM calls, observable token usage).
-- **End-user productization** through a Streamlit app with history loading and blog bundle export.
-
----
 
 ## Current architecture
 
